@@ -15,7 +15,7 @@ func TestAvailableAcceptsATokenThatOnlyRESTCanValidate(t *testing.T) {
 	t.Parallel()
 
 	host := New(githubTestCmdFactory(map[string]githubTestResponse{
-		"gh auth status --hostname github.com":           {stderr: "github.com\n  X Failed to log in to github.com using token (GH_TOKEN)\n  - The token in GH_TOKEN is invalid.\n", code: 1},
+		"gh auth status --hostname github.com":           {stderr: "github.com\n  X Failed to log in to github.com using token (GH_TOKEN)\n  - " + graphQLRefusal, code: 1},
 		"gh api --hostname github.com --method GET user": {stdout: `{"login":"someone"}`},
 	}), func() bool { return true }, "github.com", "test/repo")
 
@@ -24,11 +24,25 @@ func TestAvailableAcceptsATokenThatOnlyRESTCanValidate(t *testing.T) {
 	}
 }
 
+func TestAvailableKeepsOrdinaryAuthFailuresEvenWhenRESTWorks(t *testing.T) {
+	t.Parallel()
+
+	host := New(githubTestCmdFactory(map[string]githubTestResponse{
+		"gh auth status --hostname github.com":           {stderr: "The token in GH_TOKEN is invalid\n", code: 1},
+		"gh api --hostname github.com --method GET user": {stdout: `{"login":"someone"}`},
+	}), func() bool { return true }, "github.com", "test/repo")
+
+	err := host.Available(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "not authenticated") {
+		t.Fatalf("Available() error = %v, want not authenticated", err)
+	}
+}
+
 func TestAvailableStillReportsATokenThatRESTRejectsToo(t *testing.T) {
 	t.Parallel()
 
 	host := New(githubTestCmdFactory(map[string]githubTestResponse{
-		"gh auth status":           {stderr: "github.com\n  X Failed to log in\n", code: 1},
+		"gh auth status":           {stderr: graphQLRefusal, code: 1},
 		"gh api --method GET user": {stderr: "HTTP 401: Bad credentials\n", code: 1},
 	}), func() bool { return true }, "", "test/repo")
 

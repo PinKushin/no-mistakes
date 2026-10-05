@@ -185,7 +185,7 @@ func (h *Host) Available(ctx context.Context) error {
 		// that refuses GraphQL reports a working token as invalid. One REST call
 		// with the same token tells the two apart; a genuinely bad token or an
 		// unreachable host fails it too and keeps the original error.
-		if h.restAuthWorks(ctx) {
+		if h.noteGraphQLRefusal(stderr.Bytes(), err) && h.restAuthWorks(ctx) {
 			return nil
 		}
 		detail := strings.TrimSpace(stderr.String())
