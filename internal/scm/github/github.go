@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/kunchenguid/no-mistakes/internal/scm"
@@ -34,6 +35,10 @@ type Host struct {
 	// http.DefaultClient against uploads.github.com (or uploads.<ghec-host>).
 	assetHTTP         *http.Client
 	assetUploadPrefix string
+	// graphQLRefused latches once a gh call proves GraphQL itself is refused
+	// while REST works; every later call goes straight to the REST fallback
+	// (rest_fallback.go).
+	graphQLRefused atomic.Bool
 }
 
 // New builds a Host. cliAvailable reports whether the gh binary is
@@ -176,6 +181,13 @@ func (h *Host) Available(ctx context.Context) error {
 		if isMissingExecutable(err) {
 			return fmt.Errorf("gh CLI is not on PATH: %w", err)
 		}
+		// `gh auth status` validates the token over GraphQL, so an environment
+		// that refuses GraphQL reports a working token as invalid. One REST call
+		// with the same token tells the two apart; a genuinely bad token or an
+		// unreachable host fails it too and keeps the original error.
+		if h.noteGraphQLRefusal(stderr.Bytes(), err) && h.restAuthWorks(ctx) {
+			return nil
+		}
 		detail := strings.TrimSpace(stderr.String())
 		if detail != "" {
 			return fmt.Errorf("gh CLI is not authenticated: %s: %w", detail, err)
@@ -237,6 +249,9 @@ func parsePullRequestURL(raw, expectedHost, expectedRepo string) (int, error) {
 }
 
 func (h *Host) FindPR(ctx context.Context, branch, base string) (*scm.PR, error) {
+	if h.useREST() {
+		return h.restFindPR(ctx, branch, base)
+	}
 	args := []string{"pr", "list", "--head", branch}
 	if strings.TrimSpace(base) != "" {
 		args = append(args, "--base", base)
@@ -250,6 +265,9 @@ func (h *Host) FindPR(ctx context.Context, branch, base string) (*scm.PR, error)
 	cmd := h.cmd(ctx, "gh", args...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
+		if h.noteGraphQLRefusal(out, err) {
+			return h.restFindPR(ctx, branch, base)
+		}
 		return nil, fmt.Errorf("gh pr list: %s: %w", strings.TrimSpace(string(out)), err)
 	}
 	var prs []struct {
@@ -326,6 +344,9 @@ func (h *Host) matchesHead(headRefName string, owner *struct {
 }
 
 func (h *Host) CreatePR(ctx context.Context, branch, base string, content scm.PRContent) (*scm.PR, error) {
+	if h.useREST() {
+		return h.restCreatePR(ctx, branch, base, content)
+	}
 	args := append([]string{"pr", "create",
 		"--head", h.headRef(branch),
 		"--base", base,
@@ -338,6 +359,9 @@ func (h *Host) CreatePR(ctx context.Context, branch, base string, content scm.PR
 	cmd.Stdin = strings.NewReader(content.Body)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
+		if h.noteGraphQLRefusal(out, err) {
+			return h.restCreatePR(ctx, branch, base, content)
+		}
 		return nil, fmt.Errorf("gh pr create: %s: %w", strings.TrimSpace(string(out)), err)
 	}
 	url := strings.TrimSpace(string(out))
@@ -353,6 +377,19 @@ func (h *Host) UpdatePR(ctx context.Context, pr *scm.PR, content scm.PRContent) 
 	if err != nil {
 		return nil, err
 	}
+	restUpdate := func() (*scm.PR, error) {
+		fields := map[string]string{"body": content.Body}
+		if strings.TrimSpace(content.Title) != "" {
+			fields["title"] = content.Title
+		}
+		if err := h.restPatchPull(ctx, selector, fields); err != nil {
+			return nil, err
+		}
+		return pr, nil
+	}
+	if h.useREST() {
+		return restUpdate()
+	}
 	args := append([]string{"pr", "edit", selector}, h.repoArgs()...)
 	if strings.TrimSpace(content.Title) != "" {
 		args = append(args, "--title", content.Title)
@@ -361,6 +398,9 @@ func (h *Host) UpdatePR(ctx context.Context, pr *scm.PR, content scm.PRContent) 
 	cmd := h.cmd(ctx, "gh", args...)
 	cmd.Stdin = strings.NewReader(content.Body)
 	if out, err := cmd.CombinedOutput(); err != nil {
+		if h.noteGraphQLRefusal(out, err) {
+			return restUpdate()
+		}
 		return nil, fmt.Errorf("gh pr edit: %s: %w", strings.TrimSpace(string(out)), err)
 	}
 	return pr, nil
@@ -375,7 +415,25 @@ func (h *Host) GetPRContent(ctx context.Context, pr *scm.PR) (scm.PRContent, err
 	}
 	args := append([]string{"pr", "view", selector}, h.repoArgs()...)
 	args = append(args, "--json", "title,body")
-	out, err := h.cmd(ctx, "gh", args...).Output()
+	var out []byte
+	if !h.useREST() {
+		out, err = h.cmd(ctx, "gh", args...).Output()
+	}
+	if h.useREST() || h.noteGraphQLRefusal(out, err) {
+		pull, restErr := h.restGetPull(ctx, selector)
+		if restErr != nil {
+			return scm.PRContent{}, restErr
+		}
+		if pull.Title == nil {
+			return scm.PRContent{}, fmt.Errorf("parse gh api pull request: missing or null title")
+		}
+		// REST reports an empty description as null where GraphQL reports "".
+		body := ""
+		if pull.Body != nil {
+			body = *pull.Body
+		}
+		return scm.PRContent{Title: *pull.Title, Body: body}, nil
+	}
 	if err != nil {
 		return scm.PRContent{}, fmt.Errorf("gh pr view: %w", err)
 	}
@@ -399,8 +457,14 @@ func (h *Host) SetPRBaseBranch(ctx context.Context, pr *scm.PR, baseBranch strin
 	}
 	args := append([]string{"pr", "edit", selector}, h.repoArgs()...)
 	args = append(args, "--base", baseBranch)
+	if h.useREST() {
+		return h.restPatchPull(ctx, selector, map[string]string{"base": baseBranch})
+	}
 	cmd := h.cmd(ctx, "gh", args...)
 	if out, err := cmd.CombinedOutput(); err != nil {
+		if h.noteGraphQLRefusal(out, err) {
+			return h.restPatchPull(ctx, selector, map[string]string{"base": baseBranch})
+		}
 		return fmt.Errorf("gh pr edit --base: %s: %w", strings.TrimSpace(string(out)), err)
 	}
 	return nil
@@ -413,8 +477,17 @@ func (h *Host) GetPRState(ctx context.Context, pr *scm.PR) (scm.PRState, error) 
 	}
 	args := append([]string{"pr", "view", selector}, h.repoArgs()...)
 	args = append(args, "--json", "state", "--jq", ".state")
-	cmd := h.cmd(ctx, "gh", args...)
-	out, err := cmd.Output()
+	var out []byte
+	if !h.useREST() {
+		out, err = h.cmd(ctx, "gh", args...).Output()
+	}
+	if h.useREST() || h.noteGraphQLRefusal(out, err) {
+		pull, restErr := h.restGetPull(ctx, selector)
+		if restErr != nil {
+			return "", restErr
+		}
+		return restPRState(pull), nil
+	}
 	if err != nil {
 		return "", fmt.Errorf("gh pr view: %w", err)
 	}
@@ -428,7 +501,17 @@ func (h *Host) GetPRBaseBranch(ctx context.Context, pr *scm.PR) (string, error) 
 	}
 	args := append([]string{"pr", "view", selector}, h.repoArgs()...)
 	args = append(args, "--json", "baseRefName", "--jq", ".baseRefName")
-	out, err := h.cmd(ctx, "gh", args...).Output()
+	var out []byte
+	if !h.useREST() {
+		out, err = h.cmd(ctx, "gh", args...).Output()
+	}
+	if h.useREST() || h.noteGraphQLRefusal(out, err) {
+		pull, restErr := h.restGetPull(ctx, selector)
+		if restErr != nil {
+			return "", restErr
+		}
+		return strings.TrimSpace(pull.Base.Ref), nil
+	}
 	if err != nil {
 		return "", fmt.Errorf("gh pr view base branch: %w", err)
 	}
@@ -476,6 +559,9 @@ func (h *Host) GetChecks(ctx context.Context, pr *scm.PR) ([]scm.Check, error) {
 }
 
 func (h *Host) getPRChecks(ctx context.Context, selector string) ([]scm.Check, error) {
+	if h.useREST() {
+		return h.restPRChecks(ctx, selector)
+	}
 	args := append([]string{"pr", "checks", selector}, h.repoArgs()...)
 	args = append(args, "--json", "name,state,bucket,completedAt,link")
 	cmd := h.cmd(ctx, "gh", args...)
@@ -483,6 +569,8 @@ func (h *Host) getPRChecks(ctx context.Context, selector string) ([]scm.Check, e
 	if err != nil {
 		if strings.Contains(string(out), "no checks reported") {
 			out = []byte("[]")
+		} else if h.noteGraphQLRefusal(out, err) {
+			return h.restPRChecks(ctx, selector)
 		} else {
 			return nil, fmt.Errorf("gh pr checks: %s: %w", strings.TrimSpace(string(out)), err)
 		}
@@ -525,6 +613,9 @@ const commitChecksQuery = `query($owner:String!,$name:String!,$oid:String!,$curs
 const reviewThreadsQuery = `query($owner:String!,$name:String!,$number:Int!,$cursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){reviewThreads(first:100,after:$cursor){nodes{isResolved comments(first:100){nodes{databaseId body path line url createdAt author{login}}}} pageInfo{hasNextPage endCursor}}}}}`
 
 func (h *Host) getCommitChecks(ctx context.Context, headSHA string) ([]scm.Check, error) {
+	if h.useREST() {
+		return h.restCommitChecks(ctx, headSHA)
+	}
 	repo := h.repoSlug()
 	parts := strings.Split(repo, "/")
 	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
@@ -544,6 +635,9 @@ func (h *Host) getCommitChecks(ctx context.Context, headSHA string) ([]scm.Check
 		}
 		out, err := h.cmd(ctx, "gh", args...).CombinedOutput()
 		if err != nil {
+			if h.noteGraphQLRefusal(out, err) {
+				return h.restCommitChecks(ctx, headSHA)
+			}
 			return nil, fmt.Errorf("gh api checks for head commit: %s: %w", strings.TrimSpace(string(out)), err)
 		}
 		var response struct {
@@ -763,7 +857,19 @@ func (h *Host) checkStartedAfter(a, b scm.Check) (bool, bool) {
 func (h *Host) getPRHeadSHA(ctx context.Context, selector string) (string, error) {
 	args := append([]string{"pr", "view", selector}, h.repoArgs()...)
 	args = append(args, "--json", "headRefOid", "--jq", ".headRefOid")
-	out, err := h.cmd(ctx, "gh", args...).Output()
+	var out []byte
+	var err error
+	if !h.useREST() {
+		out, err = h.cmd(ctx, "gh", args...).Output()
+	}
+	if h.useREST() || h.noteGraphQLRefusal(out, err) {
+		pull, restErr := h.restGetPull(ctx, selector)
+		if restErr != nil {
+			return "", restErr
+		}
+		out = []byte(pull.Head.SHA)
+		err = nil
+	}
 	if err != nil {
 		return "", fmt.Errorf("gh pr view head commit: %w", err)
 	}
@@ -1138,8 +1244,17 @@ func (h *Host) GetMergeableState(ctx context.Context, pr *scm.PR) (scm.Mergeable
 	}
 	args := append([]string{"pr", "view", selector}, h.repoArgs()...)
 	args = append(args, "--json", "mergeable", "--jq", ".mergeable")
-	cmd := h.cmd(ctx, "gh", args...)
-	out, err := cmd.Output()
+	var out []byte
+	if !h.useREST() {
+		out, err = h.cmd(ctx, "gh", args...).Output()
+	}
+	if h.useREST() || h.noteGraphQLRefusal(out, err) {
+		pull, restErr := h.restGetPull(ctx, selector)
+		if restErr != nil {
+			return "", restErr
+		}
+		return restMergeableState(pull), nil
+	}
 	if err != nil {
 		return "", fmt.Errorf("gh pr view mergeable: %w", err)
 	}

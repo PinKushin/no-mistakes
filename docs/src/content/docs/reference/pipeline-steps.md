@@ -330,6 +330,7 @@ Monitors PR health after creation and auto-fixes CI failures. Mergeability polli
 **Active for GitHub, GitLab, Forgejo, Bitbucket Cloud (`bitbucket.org`), Azure DevOps (`dev.azure.com` / `*.visualstudio.com`), Gitea, and any host claimed by a [provider plugin](/no-mistakes/reference/provider-plugin-protocol/)**.
 
 - GitHub requires `gh` CLI, installed and authenticated, version >= 2.50 (older versions reject the `gh pr checks --json` call the monitor reads checks with).
+- Where GraphQL is refused with HTTP 403 but GitHub's REST API works with the same token (for example a sandbox proxy such as a Claude Code cloud session), the GitHub adapter falls back to REST: authentication is confirmed with a REST call, and finding, creating, and updating the PR, reading its state, base, head, and mergeability, and reading the head commit's check runs and commit statuses all use REST endpoints. The fallback engages only when the refusal is positively identified, and lasts for the rest of that adapter's life; any other failure keeps its original error. Review-bot comment threads and attachment uploads have no REST fallback and degrade as they already do when unreadable.
 - GitLab requires `glab` CLI, installed and authenticated.
 - Forgejo requires `forgejo-axi`, installed and authenticated.
 - Bitbucket Cloud requires `NO_MISTAKES_BITBUCKET_EMAIL` and `NO_MISTAKES_BITBUCKET_API_TOKEN`.
